@@ -1,0 +1,149 @@
+node('java') {
+  try{
+    stage ('Checkout'){
+      milestone()
+      notifyBuildBitbucket( currentBuild.result )
+      //checkout([$class: 'GitSCM', branches: [[name: 'devops']], browser: [$class: 'BitbucketWeb', repoUrl: 'https://bitbucket.org/ROkITT/etdm'], doGenerateSubmoduleConfigurations: false, extensions: [[$class: 'CheckoutOption', timeout: 60], [$class: 'CloneOption', depth: 0, noTags: false, reference: '', shallow: false, timeout: 60]], submoduleCfg: [], userRemoteConfigs: [[credentialsId: 'caa8b3e6-693c-47af-9350-5148715f011c', url: 'git@bitbucket.org:ROkITT/etdm.git']]])
+      checkout scm
+
+      gitCommit = sh(returnStdout: true, script: 'git rev-parse HEAD').trim()
+      shortCommit = gitCommit.take(6)
+      gitBranch = scm.branches[0].name
+      //gitBranch = "devops"
+      //env.BRANCH_NAME
+
+      //buildVersion = sh(returnStdout: true, script: 'cat ./package.json | jq -r ".version"').trim()
+      buildVersion = "0.0.0"
+      buildDisplayName = "${buildVersion}.${env.BUILD_NUMBER}-${shortCommit}"
+      currentBuild.displayName = buildDisplayName
+
+      println gitCommit
+      println shortCommit
+      println gitBranch
+      println buildVersion
+      sh "env"
+    }
+    lock(resource: "s3://etdm/astra/${gitBranch}", inversePrecedence: true) {
+      milestone()
+      stage ('Build'){
+        dir('frontend'){
+          sh "npm config set registry https://nexus3.rokittechua.com/repository/registry-npmjs-org-proxy/"
+          sh 'npm install bower-nexus3-resolver'
+          //bower_cfg = "{ \"registry\" : { \"search\" : [ \"https://nexus3.rokittechua.com/repository/bower-proxy\" ] }, \"resolvers\" : [ \"bower-nexus3-resolver\" ] }"
+          sh 'echo \'{ "registry" : { "search" : [ "https://nexus3.rokittechua.com/repository/bower-proxy" ] }, "resolvers" : [ "bower-nexus3-resolver" ] }\'  > .bowerrc'
+        }        
+        //GIT_BRANCH - fix maven git plugin
+        //maven.repo.local - isolate maven repo per each job
+        withEnv(["GIT_BRANCH=${gitBranch}", "MAVEN_OPTS=-Dmaven.repo.local=${env.HOME}/.m2/repository/${env.JOB_BASE_NAME}"]) {
+            //clean target dirs
+          sh "mvn clean"
+            //build storage
+          //sh "mvn -pl dist -pl .,storage-server  clean install -DskipTests -Dassembly.skipAssembly -P dev,spark"
+         sh "mvn install -DskipTests=true -P dev,spark"
+            //run storage
+          try{
+            dir('build'){
+              sh "rm -f data/h2/*"
+              sh "./start_storage.sh 1 3"
+            }
+            //generate h2 db from java sources
+            dir('launcher'){
+              sh "mvn test -Pdev,spark,generate-database"
+              sh "mvn package -DskipTests -P dev,spark,liquibase-update-from-script,copy-h2-to-build-folder"
+            }
+          }
+          finally {
+              dir('build'){
+                 sh "./stop_storage.sh"
+              }
+          }
+          //build again and pack to zip
+          sh "mvn package -P dev,spark,frontend_node,frontend"
+        }
+      }//stage
+      stage ('process build results'){
+        //catch up build results
+        milestone()
+        parallel (
+          "sonar": {
+            sh "mvn sonar:sonar -Dsonar.host.url=https://sonar.rokittechua.com -Dsonar.projectVersion=${buildDisplayName} -Dsonar.branch=${gitBranch} -Dsonar.jacoco.reportMissing.force.zero=true"
+          },
+          "junit": {
+            junit allowEmptyResults: true, testResults: '**/surefire-reports/*.xml'
+          },
+          "jacoco": {
+            step([$class: 'JacocoPublisher'])
+          },
+          "upload_artifact": {
+            withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', accessKeyVariable: 'AWS_ACCESS_KEY_ID', credentialsId: 'aws-jenkins-astra', secretKeyVariable: 'AWS_SECRET_ACCESS_KEY']]) {
+              sh "aws s3 cp dist/target/edm-bin.zip s3://etdm/astra/${gitBranch}/ --acl authenticated-read --region eu-central-1"
+            }
+          }
+        )
+      }//stage
+    }//lock
+    //archive 'dist/target/edm-bin.zip'
+    currentBuild.result = 'SUCCESS'
+    //send notification if previos build was failed and current is success
+    if(!hudson.model.Result.SUCCESS.equals(currentBuild.rawBuild.getPreviousBuild()?.getResult())) {
+      notifyBuildEmail(currentBuild.result)
+      notifyBuildSlack(currentBuild.result)
+    }    
+  } catch (e) {
+    currentBuild.result = 'FAILURE'
+    notifyBuildSlack(currentBuild.result)
+    notifyBuildEmail(currentBuild.result)
+    throw e
+  } finally {    
+    notifyBuildBitbucket( currentBuild.result )
+  }    
+}
+
+def notifyBuildEmail(String buildStatus) {
+  // build status of null means build started
+  buildStatus =  buildStatus ?: 'STARTED'
+
+  def subject = "${buildStatus}: Job '${env.JOB_NAME} [${env.BUILD_NUMBER}]'"
+  def summary = "${subject} (${env.BUILD_URL})"
+
+  emailext (
+    body: summary, 
+    recipientProviders: [[$class: 'DevelopersRecipientProvider'], [$class: 'RequesterRecipientProvider']], 
+    subject: subject )
+}
+
+@NonCPS
+def notifyBuildBitbucket(String buildStatus) {
+  // map  jenkins build status to bitbucket
+  if ( buildStatus == null )
+    buildState = 'INPROGRESS'
+  else if ( buildStatus == 'SUCCESS' )
+    buildState = 'SUCCESSFUL'    
+  else
+    buildState = 'FAILED'
+
+  bitbucketStatusNotify ( buildState: buildState )
+}
+
+@NonCPS
+def notifyBuildSlack(String buildStatus) {
+  // build status of null means build started
+  buildStatus =  buildStatus ?: 'STARTED'
+
+  // Default values
+  def colorCode = '#FF0000'
+  def subject = "${buildStatus}: Job '${env.JOB_NAME} [${env.BUILD_NUMBER}]'"
+  def summary = "${subject} (${env.BUILD_URL})"
+  // Override default values based on build status
+  if (buildStatus == 'STARTED') {
+    colorCode = '#FFFF00'
+  } else if (buildStatus == 'SUCCESS') {
+    colorCode = '#00FF00'
+  } else {
+    colorCode = '#FF0000'
+  }
+
+  // Send notifications
+  slackSend (color: colorCode, channel: '#astra_jenkins', message: summary)
+}
+
