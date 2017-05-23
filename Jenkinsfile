@@ -7,5 +7,10 @@ pipeline {
         cleanWs(cleanWhenAborted: true, cleanWhenFailure: true, cleanWhenSuccess: true, cleanWhenNotBuilt: true, cleanWhenUnstable: true, cleanupMatrixParent: true, deleteDirs: true, notFailBuild: true)
       }
     }
+    stage('mvn-build') {
+      steps {
+        sh 'mvn install'
+      }
+    }
   }
 }
