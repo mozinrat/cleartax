@@ -5,6 +5,11 @@ pipeline {
       steps {
         echo 'Getting started'
       }
+    },
+    stage('first') {
+      steps {
+        echo 'Getting started'
+      }
     }
   }
 }
